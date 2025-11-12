@@ -1,0 +1,1716 @@
+//+------------------------------------------------------------------+
+//|                                         Phoenix Recovery EA.mq5  |
+//|                                      نظام التوزيع الموحد للأهداف |
+//|                                                         V 2.10   |
+//+------------------------------------------------------------------+
+#property copyright "Phoenix Recovery EA"
+#property link      ""
+#property version   "2.10"
+#property strict
+
+input int GridStepPips = 200;                // المسافة بين الخطوط بالنقاط
+input int NumberOfLines = 10;                // عدد الخطوط فوق/تحت
+input double MaxDistanceForNewEntry = 400.0;
+input double RiskPerThousand = 0.005;
+input int Slippage = 10;
+input string CommentPrefix = "PHX_";
+input double RecoveryPercent = 25.0;         // ⭐ نسبة الاسترداد %
+input double TotalProfitPercent = 3.0;
+input bool RunOneCycle = false;
+
+double globalTotalLoss = 0.0;
+string redLineName = "";
+string lastDeletedLineName = "";             // ⭐ آخر خط محذوف
+
+struct LineStatus
+{
+   string lineName;
+   double priceLevel;
+   int lastPosition;
+   ulong ticket;
+   double openEquity;
+   double targetProfit;
+   int tradeCount;
+   bool hasOpenedTrade;
+   bool isOpening;
+   bool isFirstTrade;
+   double redLinePrice;
+};
+
+LineStatus lineStatuses[];
+bool isFirstRun = true;
+bool linesDrawn = false;
+double cycleStartEquity = 0;
+double cycleTotalTarget = 0;
+bool cycleCompleted = false;
+
+int OnInit()
+{
+   Print("==============================================");
+   Print("🔥 Phoenix Recovery EA - V2.10 (Grid System)");
+   Print("==============================================");
+   Print("نظام Grid - المسافة بين الخطوط: ", GridStepPips, " نقطة");
+   Print("عدد الخطوط فوق/تحت: ", NumberOfLines);
+   Print("المسافة القصوى لفتح صفقة جديدة: ", MaxDistanceForNewEntry, " نقطة");
+   Print("المخاطرة: ", RiskPerThousand, " دولار لكل 1000 دولار من الرصيد");
+   Print("نسبة الاسترداد: ", RecoveryPercent, "%");  // ⭐ تغيير الطباعة
+   Print("نسبة الربح الإجمالي: ", TotalProfitPercent, "%");
+   Print("وضع الدورة الواحدة: ", RunOneCycle ? "مفعّل" : "معطّل");
+   Print("==============================================");
+   
+   DeleteOrangeLinesOnly();
+   DeleteRedLine();
+   DrawLines();
+   InitializeLineStatuses();
+   RecalculateAllTargets();
+   
+   if(cycleStartEquity == 0)
+   {
+      cycleStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      cycleTotalTarget = cycleStartEquity * (1 + TotalProfitPercent / 100.0);
+      Print("بداية الدورة | الإيكويتي: ", cycleStartEquity, " | الهدف الإجمالي: ", cycleTotalTarget);
+   }
+   else
+   {
+      cycleTotalTarget = cycleStartEquity * (1 + TotalProfitPercent / 100.0);
+      Print("تم تحديث الهدف الإجمالي: ", cycleTotalTarget);
+   }
+   
+   UpdateTargetLabel();
+   
+   cycleCompleted = false;
+   isFirstRun = true;
+   linesDrawn = true;
+   redLineName = "";
+   lastDeletedLineName = "";
+   
+   Print("✅ Phoenix Recovery EA جاهز للعمل!");
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason)
+{
+   if(reason == REASON_REMOVE || reason == REASON_CHARTCLOSE || reason == REASON_CLOSE)
+   {
+      Print("حذف الخطوط - السبب: ", reason);
+      DeleteAllLines();
+      DeleteRedLine();
+      ObjectDelete(ChartID(), "CHL_TargetLabel");
+      ObjectDelete(ChartID(), "CHL_LossLabel");
+      ObjectDelete(ChartID(), "CHL_TotalProfitLabel");
+      ObjectDelete(ChartID(), "CHL_TargetPerTradeLabel");
+      ObjectDelete(ChartID(), "CHL_OpenPositionsLabel");
+   }
+   else
+   {
+      Print("الاحتفاظ بالخطوط - السبب: ", reason, " (تغيير إعدادات)");
+   }
+}
+
+void OnTick()
+{
+   if(cycleCompleted && RunOneCycle)
+   {
+      return;
+   }
+   
+   UpdateTargetLabel();
+   UpdateLossLabel();
+   UpdateTotalProfitLabel();
+   UpdateTargetPerTradeLabel();
+   UpdateOpenPositionsLabel();
+   CheckTotalProfitTarget();
+   CheckProfitTargets();
+   CheckRedLineReversal();
+   CleanupClosedPositions();
+   
+   static datetime lastBarTime = 0;
+   datetime currentBarTime = iTime(_Symbol, _Period, 0);
+   
+   if(currentBarTime != lastBarTime)
+   {
+      if(!isFirstRun)
+      {
+         CheckLinesCrossing();
+      }
+      else
+      {
+         isFirstRun = false;
+         Print("التهيئة الأولى - الإكسبرت جاهز لفتح الصفقات عند اختراق الخطوط");
+      }
+      
+      lastBarTime = currentBarTime;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ⭐⭐⭐ إعادة حساب الأهداف (Total Profit ثابت بالنسبة المئوية) ⭐⭐⭐ |
+//+------------------------------------------------------------------+
+void RecalculateAllTargets()
+{
+   int openPositionsCount = CountOpenPositions();
+   
+   if(openPositionsCount == 0)
+   {
+      Print("لا توجد صفقات مفتوحة - لا حاجة لإعادة حساب الأهداف");
+      return;
+   }
+   
+   if(globalTotalLoss > 0)
+   {
+      Print("🔄 تم اكتشاف خسائر! سيتم تحويل كل الصفقات لنظام التوزيع");
+      
+      for(int i = 0; i < ArraySize(lineStatuses); i++)
+      {
+         if(lineStatuses[i].ticket > 0 && lineStatuses[i].isFirstTrade)
+         {
+            Print("تحويل الصفقة ", lineStatuses[i].lineName, " من صفقة أولى إلى نظام التوزيع");
+            lineStatuses[i].isFirstTrade = false;
+            
+            DeleteTargetLabel(lineStatuses[i].lineName);
+         }
+      }
+   }
+   
+   double totalTarget = 0;
+   
+   if(globalTotalLoss > 0)
+   {
+      // ⭐⭐⭐ Total Profit بالنسبة المئوية
+      totalTarget = globalTotalLoss + (globalTotalLoss * RecoveryPercent / 100.0);
+      Print("📊 إعادة حساب الأهداف | الخسارة: ", globalTotalLoss, " | الهدف الكلي: ", totalTarget);
+   }
+   else
+   {
+      Print("📊 لا توجد خسائر - الصفقات ستستخدم أهدافها الفردية");
+      return;
+   }
+   
+   int distributedPositionsCount = 0;
+   for(int i = 0; i < ArraySize(lineStatuses); i++)
+   {
+      if(lineStatuses[i].ticket > 0)
+      {
+         distributedPositionsCount++;
+      }
+   }
+   
+   if(distributedPositionsCount == 0)
+   {
+      Print("⚠️ لا توجد صفقات مفتوحة");
+      return;
+   }
+   
+   double targetPerPosition = totalTarget / distributedPositionsCount;
+   
+   Print("🎯 الهدف لكل صفقة: ", targetPerPosition, " | عدد الصفقات: ", distributedPositionsCount);
+   
+   for(int i = 0; i < ArraySize(lineStatuses); i++)
+   {
+      if(lineStatuses[i].ticket > 0)
+      {
+         lineStatuses[i].targetProfit = targetPerPosition;
+         Print("✅ تحديث هدف الخط: ", lineStatuses[i].lineName, " → ", targetPerPosition, "$");
+      }
+   }
+}
+
+void CreateOrUpdateTargetLabel(string lineName, double priceLevel, double targetProfit)
+{
+   long chartID = ChartID();
+   string labelName = "Target_" + lineName;
+   string labelText = StringFormat("%.2f$", targetProfit);
+   
+   if(ObjectFind(chartID, labelName) >= 0)
+   {
+      ObjectDelete(chartID, labelName);
+   }
+   
+   datetime lineTime = iTime(_Symbol, _Period, 1);
+   
+   if(ObjectCreate(chartID, labelName, OBJ_TEXT, 0, lineTime, priceLevel))
+   {
+      ObjectSetString(chartID, labelName, OBJPROP_TEXT, labelText);
+      ObjectSetInteger(chartID, labelName, OBJPROP_COLOR, clrOrange);
+      ObjectSetInteger(chartID, labelName, OBJPROP_FONTSIZE, 10);
+      ObjectSetString(chartID, labelName, OBJPROP_FONT, "Arial Bold");
+      ObjectSetInteger(chartID, labelName, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(chartID, labelName, OBJPROP_BACK, false);
+      ObjectSetInteger(chartID, labelName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(chartID, labelName, OBJPROP_SELECTED, false);
+      ChartRedraw(chartID);
+   }
+}
+
+void DeleteTargetLabel(string lineName)
+{
+   long chartID = ChartID();
+   string labelName = "Target_" + lineName;
+   
+   if(ObjectFind(chartID, labelName) >= 0)
+   {
+      ObjectDelete(chartID, labelName);
+   }
+}
+
+double PipsToPrice(double pips)
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   double pipFactor = 1.0;
+   if(digits == 3 || digits == 5)
+      pipFactor = 10.0;
+   
+   return pips * pipFactor * point;
+}
+
+double AddOnePip(double price, bool addUp)
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   double pipFactor = 1.0;
+   if(digits == 3 || digits == 5)
+      pipFactor = 10.0;
+   
+   double onePip = point * pipFactor;
+   
+   if(addUp)
+      return price + onePip;
+   else
+      return price - onePip;
+}
+
+double PriceDistanceInPips(double price1, double price2)
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   double pipFactor = 1.0;
+   if(digits == 3 || digits == 5)
+      pipFactor = 10.0;
+   
+   return MathAbs(price1 - price2) / (point * pipFactor);
+}
+
+string GetTradeRetcodeDescription(uint retcode)
+{
+   switch(retcode)
+   {
+      case TRADE_RETCODE_REQUOTE: return "إعادة تسعير";
+      case TRADE_RETCODE_REJECT: return "الطلب مرفوض";
+      case TRADE_RETCODE_CANCEL: return "تم إلغاء الطلب";
+      case TRADE_RETCODE_PLACED: return "تم وضع الأمر";
+      case TRADE_RETCODE_DONE: return "تم التنفيذ";
+      case TRADE_RETCODE_DONE_PARTIAL: return "تنفيذ جزئي";
+      case TRADE_RETCODE_ERROR: return "خطأ عام";
+      case TRADE_RETCODE_TIMEOUT: return "انتهاء الوقت";
+      case TRADE_RETCODE_INVALID: return "طلب غير صحيح";
+      case TRADE_RETCODE_INVALID_VOLUME: return "حجم غير صحيح";
+      case TRADE_RETCODE_INVALID_PRICE: return "سعر غير صحيح";
+      case TRADE_RETCODE_INVALID_STOPS: return "وقف خاطئ";
+      case TRADE_RETCODE_TRADE_DISABLED: return "التداول معطل";
+      case TRADE_RETCODE_MARKET_CLOSED: return "السوق مغلق";
+      case TRADE_RETCODE_NO_MONEY: return "لا يوجد رصيد كافٍ";
+      case TRADE_RETCODE_PRICE_CHANGED: return "تغير السعر";
+      case TRADE_RETCODE_PRICE_OFF: return "لا توجد أسعار";
+      case TRADE_RETCODE_INVALID_EXPIRATION: return "انتهاء صلاحية غير صحيح";
+      case TRADE_RETCODE_ORDER_CHANGED: return "تم تغيير الأمر";
+      case TRADE_RETCODE_TOO_MANY_REQUESTS: return "عدد كبير جداً من الطلبات";
+      case TRADE_RETCODE_NO_CHANGES: return "لا توجد تغييرات";
+      case TRADE_RETCODE_SERVER_DISABLES_AT: return "الخادم يعطل التداول الآلي";
+      case TRADE_RETCODE_CLIENT_DISABLES_AT: return "العميل يعطل التداول الآلي";
+      case TRADE_RETCODE_LOCKED: return "مقفل";
+      case TRADE_RETCODE_FROZEN: return "مجمد";
+      case TRADE_RETCODE_INVALID_FILL: return "تعبئة غير صحيحة";
+      case TRADE_RETCODE_CONNECTION: return "لا يوجد اتصال";
+      case TRADE_RETCODE_ONLY_REAL: return "مسموح فقط للحسابات الحقيقية";
+      case TRADE_RETCODE_LIMIT_ORDERS: return "حد الأوامر المعلقة";
+      case TRADE_RETCODE_LIMIT_VOLUME: return "حد الحجم";
+      default: return "خطأ غير معروف: " + IntegerToString(retcode);
+   }
+}
+
+bool ClosePositionForce(ulong ticket, int maxRetries = 10)
+{
+   if(ticket == 0) 
+   {
+      Print("❌ Ticket = 0, لا يمكن الإغلاق");
+      return false;
+   }
+   
+   Print("🔄 بداية إغلاق الصفقة: ", ticket);
+   
+   if(!PositionSelectByTicket(ticket))
+   {
+      Print("✅ الصفقة مقفلة مسبقاً: ", ticket);
+      return true;
+   }
+   
+   for(int attempt = 1; attempt <= maxRetries; attempt++)
+   {
+      Print("📌 محاولة إغلاق #", attempt, " من ", maxRetries);
+      
+      if(!PositionSelectByTicket(ticket))
+      {
+         Print("✅ الصفقة أغلقت بنجاح في المحاولة #", attempt);
+         return true;
+      }
+      
+      MqlTradeRequest request;
+      MqlTradeResult result;
+      ZeroMemory(request);
+      ZeroMemory(result);
+      
+      request.action = TRADE_ACTION_DEAL;
+      request.position = ticket;
+      request.symbol = _Symbol;
+      request.volume = PositionGetDouble(POSITION_VOLUME);
+      request.deviation = Slippage * 2;
+      request.magic = 123456;
+      
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+      {
+         request.type = ORDER_TYPE_SELL;
+         request.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      }
+      else
+      {
+         request.type = ORDER_TYPE_BUY;
+         request.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      }
+      
+      if(OrderSend(request, result))
+      {
+         if(result.retcode == TRADE_RETCODE_DONE)
+         {
+            Print("✅ تم إرسال أمر الإغلاق بنجاح - المحاولة #", attempt);
+            Sleep(300);
+            
+            if(!PositionSelectByTicket(ticket))
+            {
+               Print("✅✅ تأكيد نهائي: الصفقة مقفلة تماماً!");
+               return true;
+            }
+            else
+            {
+               Print("⚠️ الصفقة لا تزال موجودة رغم نجاح الأمر!");
+            }
+         }
+         else
+         {
+            Print("⚠️ فشل الإغلاق - رمز الخطأ: ", result.retcode, " | ", GetTradeRetcodeDescription(result.retcode));
+         }
+      }
+      else
+      {
+         Print("❌ فشل إرسال أمر الإغلاق");
+      }
+      
+      if(attempt < maxRetries)
+      {
+         int waitTime = attempt * 500;
+         Print("⏳ انتظار ", waitTime, " ميلي ثانية قبل المحاولة التالية...");
+         Sleep(waitTime);
+      }
+   }
+   
+   Print("❌❌❌ فشل إغلاق الصفقة بعد ", maxRetries, " محاولة! Ticket: ", ticket);
+   
+   if(!PositionSelectByTicket(ticket))
+   {
+      Print("✅ الفحص الأخير: الصفقة مقفلة!");
+      return true;
+   }
+   
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| ⭐⭐⭐ فحص الخط الأحمر للعكس الفوري ⭐⭐⭐                          |
+//+------------------------------------------------------------------+
+void CheckRedLineReversal()
+{
+   long chartID = ChartID();
+   double currentClose = iClose(_Symbol, _Period, 1);
+   
+   for(int i = 0; i < ArraySize(lineStatuses); i++)
+   {
+      if(lineStatuses[i].ticket > 0 && lineStatuses[i].redLinePrice > 0)
+      {
+         if(PositionSelectByTicket(lineStatuses[i].ticket))
+         {
+            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            bool shouldReverse = false;
+            
+            if(posType == POSITION_TYPE_BUY)
+            {
+               if(currentClose < lineStatuses[i].redLinePrice)
+               {
+                  shouldReverse = true;
+                  Print("🔴 عكس فوري! صفقة Buy أغلقت تحت الخط الأحمر | الخط: ", lineStatuses[i].lineName);
+               }
+            }
+            else
+            {
+               if(currentClose > lineStatuses[i].redLinePrice)
+               {
+                  shouldReverse = true;
+                  Print("🔴 عكس فوري! صفقة Sell أغلقت فوق الخط الأحمر | الخط: ", lineStatuses[i].lineName);
+               }
+            }
+            
+            if(shouldReverse)
+            {
+               if(lineStatuses[i].isOpening)
+               {
+                  Print("⚠️ عملية فتح جارية على الخط - تم تجاهل العكس الفوري");
+                  continue;
+               }
+               
+               double lastLoss = PositionGetDouble(POSITION_PROFIT);
+               if(lastLoss < 0)
+               {
+                  globalTotalLoss += MathAbs(lastLoss);
+                  Print("💰 خسارة على العكس الفوري: ", MathAbs(lastLoss), " | إجمالي الخسائر العام: ", globalTotalLoss);
+               }
+               
+               ulong oldTicket = lineStatuses[i].ticket;
+               string oldLineName = lineStatuses[i].lineName;
+               double oldPriceLevel = lineStatuses[i].priceLevel;
+               
+               bool closed = ClosePositionForce(oldTicket, 10);
+               
+               if(!closed)
+               {
+                  Print("❌❌❌ إغلاق مستحيل! سيتم إيقاف العكس");
+                  continue;
+               }
+               
+               Print("✅ تأكيد: الصفقة مقفلة 100% - سيتم فتح الصفقة المعاكسة");
+               
+               lineStatuses[i].isOpening = true;
+               
+               // ⭐ إعادة رسم الخط البرتقالي القديم
+               if(lastDeletedLineName != "")
+               {
+                  RestorePreviousDeletedLine();
+               }
+               
+               double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+               lineStatuses[i].openEquity = currentEquity;
+               lineStatuses[i].tradeCount++;
+               lineStatuses[i].isFirstTrade = false;
+               
+               DeleteTargetLabel(lineStatuses[i].lineName);
+               
+               if(posType == POSITION_TYPE_BUY)
+               {
+                  Print("🔄 فتح صفقة Sell معاكسة...");
+                  lineStatuses[i].ticket = OpenSell(lineStatuses[i].lineName);
+                  lineStatuses[i].lastPosition = -1;
+                  
+                  double newRedLinePrice = AddOnePip(iHigh(_Symbol, _Period, 1), true);
+                  lineStatuses[i].redLinePrice = newRedLinePrice;
+                  DrawRedLine(newRedLinePrice);
+                  
+                  Print("🔴 تم رسم الخط الأحمر عند: ", newRedLinePrice, " (High + 1 نقطة)");
+               }
+               else
+               {
+                  Print("🔄 فتح صفقة Buy معاكسة...");
+                  lineStatuses[i].ticket = OpenBuy(lineStatuses[i].lineName);
+                  lineStatuses[i].lastPosition = 1;
+                  
+                  double newRedLinePrice = AddOnePip(iLow(_Symbol, _Period, 1), false);
+                  lineStatuses[i].redLinePrice = newRedLinePrice;
+                  DrawRedLine(newRedLinePrice);
+                  
+                  Print("🔴 تم رسم الخط الأحمر عند: ", newRedLinePrice, " (Low - 1 نقطة)");
+               }
+               
+               // ⭐ تحديث آخر خط محذوف
+               lastDeletedLineName = oldLineName;
+               
+               RecalculateAllTargets();
+               
+               lineStatuses[i].isOpening = false;
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ⭐ دالة إعادة رسم آخر خط محذوف                                    |
+//+------------------------------------------------------------------+
+void RestorePreviousDeletedLine()
+{
+   if(lastDeletedLineName == "")
+      return;
+   
+   // البحث عن الخط في lineStatuses
+   for(int i = 0; i < ArraySize(lineStatuses); i++)
+   {
+      if(lineStatuses[i].lineName == lastDeletedLineName)
+      {
+         RedrawOrangeLine(lineStatuses[i].lineName, lineStatuses[i].priceLevel);
+         Print("🟠 تم إعادة رسم الخط السابق: ", lastDeletedLineName);
+         break;
+      }
+   }
+}
+
+void DrawRedLine(double price)
+{
+   long chartID = ChartID();
+   
+   DeleteRedLine();
+   
+   redLineName = "RedLine_Active";
+   
+   if(ObjectCreate(chartID, redLineName, OBJ_HLINE, 0, 0, price))
+   {
+      ObjectSetInteger(chartID, redLineName, OBJPROP_COLOR, clrRed);
+      ObjectSetInteger(chartID, redLineName, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSetInteger(chartID, redLineName, OBJPROP_WIDTH, 2);
+      ObjectSetInteger(chartID, redLineName, OBJPROP_BACK, false);
+      ObjectSetInteger(chartID, redLineName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(chartID, redLineName, OBJPROP_SELECTED, false);
+      
+      ChartRedraw(chartID);
+   }
+}
+
+void DeleteRedLine()
+{
+   long chartID = ChartID();
+   
+   if(redLineName != "" && ObjectFind(chartID, redLineName) >= 0)
+   {
+      ObjectDelete(chartID, redLineName);
+      ChartRedraw(chartID);
+   }
+   
+   redLineName = "";
+}
+
+void RedrawOrangeLine(string lineName, double price)
+{
+   long chartID = ChartID();
+   
+   if(ObjectCreate(chartID, lineName, OBJ_HLINE, 0, 0, price))
+   {
+      ObjectSetInteger(chartID, lineName, OBJPROP_COLOR, clrOrange);
+      ObjectSetInteger(chartID, lineName, OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(chartID, lineName, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(chartID, lineName, OBJPROP_BACK, true);
+      ObjectSetInteger(chartID, lineName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(chartID, lineName, OBJPROP_SELECTED, false);
+      
+      Print("🟠 تم إعادة رسم الخط البرتقالي: ", lineName, " عند ", price);
+      ChartRedraw(chartID);
+   }
+}
+
+void UpdateTargetLabel()
+{
+   long chartID = ChartID();
+   string labelName = "CHL_TargetLabel";
+   
+   string labelText = StringFormat("Start: %.2f$ | Target: %.2f$", cycleStartEquity, cycleTotalTarget);
+   
+   if(ObjectFind(chartID, labelName) >= 0)
+   {
+      ObjectSetString(chartID, labelName, OBJPROP_TEXT, labelText);
+   }
+   else
+   {
+      ObjectCreate(chartID, labelName, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(chartID, labelName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(chartID, labelName, OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(chartID, labelName, OBJPROP_YDISTANCE, 20);
+      ObjectSetInteger(chartID, labelName, OBJPROP_COLOR, clrOrange);
+      ObjectSetInteger(chartID, labelName, OBJPROP_FONTSIZE, 12);
+      ObjectSetString(chartID, labelName, OBJPROP_FONT, "Arial Bold");
+      ObjectSetString(chartID, labelName, OBJPROP_TEXT, labelText);
+      ObjectSetInteger(chartID, labelName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(chartID, labelName, OBJPROP_SELECTED, false);
+   }
+   
+   ChartRedraw(chartID);
+}
+
+void UpdateLossLabel()
+{
+   long chartID = ChartID();
+   string labelName = "CHL_LossLabel";
+   
+   string labelText = StringFormat("Total Loss: %.2f$", globalTotalLoss);
+   color labelColor = (globalTotalLoss > 0) ? clrRed : clrLime;
+   
+   if(ObjectFind(chartID, labelName) >= 0)
+   {
+      ObjectSetString(chartID, labelName, OBJPROP_TEXT, labelText);
+      ObjectSetInteger(chartID, labelName, OBJPROP_COLOR, labelColor);
+   }
+   else
+   {
+      ObjectCreate(chartID, labelName, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(chartID, labelName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(chartID, labelName, OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(chartID, labelName, OBJPROP_YDISTANCE, 40);
+      ObjectSetInteger(chartID, labelName, OBJPROP_COLOR, labelColor);
+      ObjectSetInteger(chartID, labelName, OBJPROP_FONTSIZE, 12);
+      ObjectSetString(chartID, labelName, OBJPROP_FONT, "Arial Bold");
+      ObjectSetString(chartID, labelName, OBJPROP_TEXT, labelText);
+      ObjectSetInteger(chartID, labelName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(chartID, labelName, OBJPROP_SELECTED, false);
+   }
+   
+   ChartRedraw(chartID);
+}
+
+//+------------------------------------------------------------------+
+//| ⭐⭐⭐ Update Total Profit Label (ثابت بالنسبة المئوية) ⭐⭐⭐      |
+//+------------------------------------------------------------------+
+void UpdateTotalProfitLabel()
+{
+   long chartID = ChartID();
+   string labelName = "CHL_TotalProfitLabel";
+   
+   double totalProfitTarget = 0.0;
+   
+   if(globalTotalLoss > 0)
+   {
+      // ⭐⭐⭐ Total Profit بالنسبة المئوية
+      totalProfitTarget = globalTotalLoss + (globalTotalLoss * RecoveryPercent / 100.0);
+   }
+   
+   string labelText = StringFormat("Total Profit: %.2f$", totalProfitTarget);
+   color labelColor = (totalProfitTarget > 0) ? clrLime : clrGray;
+   
+   if(ObjectFind(chartID, labelName) >= 0)
+   {
+      ObjectSetString(chartID, labelName, OBJPROP_TEXT, labelText);
+      ObjectSetInteger(chartID, labelName, OBJPROP_COLOR, labelColor);
+   }
+   else
+   {
+      ObjectCreate(chartID, labelName, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(chartID, labelName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(chartID, labelName, OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(chartID, labelName, OBJPROP_YDISTANCE, 60);
+      ObjectSetInteger(chartID, labelName, OBJPROP_COLOR, labelColor);
+      ObjectSetInteger(chartID, labelName, OBJPROP_FONTSIZE, 12);
+      ObjectSetString(chartID, labelName, OBJPROP_FONT, "Arial Bold");
+      ObjectSetString(chartID, labelName, OBJPROP_TEXT, labelText);
+      ObjectSetInteger(chartID, labelName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(chartID, labelName, OBJPROP_SELECTED, false);
+   }
+   
+   ChartRedraw(chartID);
+}
+
+//+------------------------------------------------------------------+
+//| ⭐⭐⭐ Update Target Per Trade Label (ثابت بالنسبة المئوية) ⭐⭐⭐  |
+//+------------------------------------------------------------------+
+void UpdateTargetPerTradeLabel()
+{
+   long chartID = ChartID();
+   string labelName = "CHL_TargetPerTradeLabel";
+   
+   double targetPerTrade = 0.0;
+   
+   if(globalTotalLoss > 0)
+   {
+      // ⭐⭐⭐ Total Profit بالنسبة المئوية
+      double totalTarget = globalTotalLoss + (globalTotalLoss * RecoveryPercent / 100.0);
+      
+      int totalOpenPositions = CountOpenPositions();
+      
+      if(totalOpenPositions > 0)
+      {
+         targetPerTrade = totalTarget / totalOpenPositions;
+      }
+   }
+   
+   string labelText = StringFormat("Target Per Trade: %.2f$", targetPerTrade);
+   color labelColor = (targetPerTrade > 0) ? clrLime : clrGray;
+   
+   if(ObjectFind(chartID, labelName) >= 0)
+   {
+      ObjectSetString(chartID, labelName, OBJPROP_TEXT, labelText);
+      ObjectSetInteger(chartID, labelName, OBJPROP_COLOR, labelColor);
+   }
+   else
+   {
+      ObjectCreate(chartID, labelName, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(chartID, labelName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(chartID, labelName, OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(chartID, labelName, OBJPROP_YDISTANCE, 80);
+      ObjectSetInteger(chartID, labelName, OBJPROP_COLOR, labelColor);
+      ObjectSetInteger(chartID, labelName, OBJPROP_FONTSIZE, 12);
+      ObjectSetString(chartID, labelName, OBJPROP_FONT, "Arial Bold");
+      ObjectSetString(chartID, labelName, OBJPROP_TEXT, labelText);
+      ObjectSetInteger(chartID, labelName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(chartID, labelName, OBJPROP_SELECTED, false);
+   }
+   
+   ChartRedraw(chartID);
+}
+
+void UpdateOpenPositionsLabel()
+{
+   long chartID = ChartID();
+   string labelName = "CHL_OpenPositionsLabel";
+   
+   int openPositions = CountOpenPositions();
+   
+   string labelText = StringFormat("Open Positions: %d", openPositions);
+   color labelColor = clrWhite;
+   
+   if(ObjectFind(chartID, labelName) >= 0)
+   {
+      ObjectSetString(chartID, labelName, OBJPROP_TEXT, labelText);
+   }
+   else
+   {
+      ObjectCreate(chartID, labelName, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(chartID, labelName, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(chartID, labelName, OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(chartID, labelName, OBJPROP_YDISTANCE, 100);
+      ObjectSetInteger(chartID, labelName, OBJPROP_COLOR, labelColor);
+      ObjectSetInteger(chartID, labelName, OBJPROP_FONTSIZE, 12);
+      ObjectSetString(chartID, labelName, OBJPROP_FONT, "Arial Bold");
+      ObjectSetString(chartID, labelName, OBJPROP_TEXT, labelText);
+      ObjectSetInteger(chartID, labelName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(chartID, labelName, OBJPROP_SELECTED, false);
+   }
+   
+   ChartRedraw(chartID);
+}
+
+void StartNewCycle()
+{
+   cycleStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   cycleTotalTarget = cycleStartEquity * (1 + TotalProfitPercent / 100.0);
+   
+   globalTotalLoss = 0.0;
+   redLineName = "";
+   lastDeletedLineName = "";
+   
+   Print(">>> START NEW CYCLE <<<");
+   Print("New Equity: ", cycleStartEquity);
+   Print("New Target: ", cycleTotalTarget);
+   Print("Global Loss Reset: 0.0");
+   
+   UpdateTargetLabel();
+   UpdateLossLabel();
+   UpdateTotalProfitLabel();
+   UpdateTargetPerTradeLabel();
+   UpdateOpenPositionsLabel();
+}
+
+int CountExistingLines()
+{
+   long chartID = ChartID();
+   int totalObjects = ObjectsTotal(chartID);
+   int lineCount = 0;
+   
+   for(int i = 0; i < totalObjects; i++)
+   {
+      string objectName = ObjectName(chartID, i);
+      if(StringFind(objectName, "GridLine_") >= 0)
+      {
+         lineCount++;
+      }
+   }
+   
+   return lineCount;
+}
+
+int CountOpenPositions()
+{
+   int count = 0;
+   
+   for(int i = 0; i < ArraySize(lineStatuses); i++)
+   {
+      if(lineStatuses[i].ticket > 0)
+      {
+         if(PositionSelectByTicket(lineStatuses[i].ticket))
+         {
+            count++;
+         }
+      }
+   }
+   
+   return count;
+}
+
+void CleanupClosedPositions()
+{
+   long chartID = ChartID();
+   
+   for(int i = ArraySize(lineStatuses) - 1; i >= 0; i--)
+   {
+      if(lineStatuses[i].ticket > 0)
+      {
+         if(!PositionSelectByTicket(lineStatuses[i].ticket))
+         {
+            Print("صفقة مقفلة تم اكتشافها (إغلاق يدوي) على الخط: ", lineStatuses[i].lineName, " | Ticket: ", lineStatuses[i].ticket);
+            Print("سيتم حذف الخط (معاملة كتحقيق هدف): ", lineStatuses[i].lineName);
+            
+            DeleteTargetLabel(lineStatuses[i].lineName);
+            
+            ObjectDelete(chartID, lineStatuses[i].lineName);
+            
+            RemoveLineFromStatus(i);
+            
+            ChartRedraw(chartID);
+            
+            int openPositions = CountOpenPositions();
+            Print("عدد الصفقات المفتوحة المتبقية: ", openPositions);
+            
+            if(openPositions == 0)
+            {
+               Print("كل الصفقات أغلقت!");
+               
+               DeleteRedLine();
+               lastDeletedLineName = "";
+               
+               if(RunOneCycle)
+               {
+                  Print(">>> وضع الدورة الواحدة مفعّل - الإكسبرت سيتوقف الآن <<<");
+                  cycleCompleted = true;
+                  return;
+               }
+               
+               Print("سيتم بداية دورة جديدة...");
+               
+               StartNewCycle();
+            }
+         }
+      }
+   }
+}
+
+void CheckTotalProfitTarget()
+{
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   if(currentEquity >= cycleTotalTarget)
+   {
+      Print("تم تحقيق الهدف الإجمالي!");
+      Print("الإيكويتي الحالي: ", currentEquity, " | الهدف كان: ", cycleTotalTarget);
+      Print("الربح المحقق: ", (currentEquity - cycleStartEquity));
+      
+      CloseAllOpenPositionsAndDeleteLines();
+      
+      if(RunOneCycle)
+      {
+         Print(">>> وضع الدورة الواحدة مفعّل - الإكسبرت سيتوقف الآن <<<");
+         cycleCompleted = true;
+         return;
+      }
+      
+      StartNewCycle();
+   }
+}
+
+void CloseAllOpenPositionsAndDeleteLines()
+{
+   long chartID = ChartID();
+   Print("جاري إقفال جميع الصفقات المفتوحة وحذف خطوطها...");
+   
+   for(int i = ArraySize(lineStatuses) - 1; i >= 0; i--)
+   {
+      if(lineStatuses[i].ticket > 0)
+      {
+         Print("إقفال الصفقة على الخط: ", lineStatuses[i].lineName, " | Ticket: ", lineStatuses[i].ticket);
+         
+         ClosePositionForce(lineStatuses[i].ticket, 10);
+         
+         DeleteTargetLabel(lineStatuses[i].lineName);
+         
+         ObjectDelete(chartID, lineStatuses[i].lineName);
+         Print("تم حذف الخط: ", lineStatuses[i].lineName);
+         
+         RemoveLineFromStatus(i);
+      }
+   }
+   
+   DeleteRedLine();
+   lastDeletedLineName = "";
+   
+   ChartRedraw(chartID);
+   Print("تم إقفال جميع الصفقات وحذف خطوطها | الخطوط المتبقية: ", ArraySize(lineStatuses));
+}
+
+double CalculateLotSize()
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   
+   double riskAmount = (balance / 1000.0) * RiskPerThousand;
+   
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   double pointValue = (tickValue / tickSize) * point;
+   
+   double lotSize = riskAmount / (pointValue * 10);
+   
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   lotSize = MathFloor(lotSize / lotStep) * lotStep;
+   
+   if(lotSize < minLot) lotSize = minLot;
+   if(lotSize > maxLot) lotSize = maxLot;
+   
+   return lotSize;
+}
+
+void CheckProfitTargets()
+{
+   long chartID = ChartID();
+   
+   for(int i = ArraySize(lineStatuses) - 1; i >= 0; i--)
+   {
+      if(lineStatuses[i].ticket > 0)
+      {
+         if(PositionSelectByTicket(lineStatuses[i].ticket))
+         {
+            double currentProfit = PositionGetDouble(POSITION_PROFIT);
+            
+            if(currentProfit >= lineStatuses[i].targetProfit)
+            {
+               Print("🎉 تم تحقيق الهدف على الخط: ", lineStatuses[i].lineName);
+               Print("الربح: ", currentProfit, " | الهدف كان: ", lineStatuses[i].targetProfit);
+               
+               if(!lineStatuses[i].isFirstTrade && globalTotalLoss > 0)
+               {
+                  globalTotalLoss -= currentProfit;
+                  if(globalTotalLoss < 0) globalTotalLoss = 0;
+                  
+                  Print("💰 خصم الربح من الخسائر | الخسائر المتبقية: ", globalTotalLoss);
+               }
+               
+               Print("سيتم حذف الخط نهائياً: ", lineStatuses[i].lineName);
+               
+               ClosePositionForce(lineStatuses[i].ticket, 10);
+               
+               DeleteTargetLabel(lineStatuses[i].lineName);
+               
+               if(ObjectFind(chartID, lineStatuses[i].lineName) >= 0)
+               {
+                  ObjectDelete(chartID, lineStatuses[i].lineName);
+                  Print("تم حذف الخط من الشارت: ", lineStatuses[i].lineName);
+               }
+               
+               RemoveLineFromStatus(i);
+               
+               ChartRedraw(chartID);
+               
+               RecalculateAllTargets();
+               
+               int openPositions = CountOpenPositions();
+               Print("عدد الصفقات المفتوحة المتبقية: ", openPositions);
+               
+               if(openPositions == 0)
+               {
+                  Print("كل الصفقات حققت أهدافها!");
+                  
+                  DeleteRedLine();
+                  lastDeletedLineName = "";
+                  
+                  if(RunOneCycle)
+                  {
+                     Print(">>> وضع الدورة الواحدة مفعّل - الإكسبرت سيتوقف الآن <<<");
+                     cycleCompleted = true;
+                     return;
+                  }
+                  
+                  Print("سيتم بداية دورة جديدة...");
+                  
+                  StartNewCycle();
+               }
+            }
+         }
+         else
+         {
+            Print("الصفقة غير موجودة! Ticket: ", lineStatuses[i].ticket, " | الخط: ", lineStatuses[i].lineName);
+            
+            DeleteTargetLabel(lineStatuses[i].lineName);
+            
+            ObjectDelete(chartID, lineStatuses[i].lineName);
+            RemoveLineFromStatus(i);
+            ChartRedraw(chartID);
+            
+            RecalculateAllTargets();
+            
+            int openPositions = CountOpenPositions();
+            Print("عدد الصفقات المفتوحة المتبقية: ", openPositions);
+            
+            if(openPositions == 0)
+            {
+               Print("كل الصفقات أغلقت!");
+               
+               DeleteRedLine();
+               lastDeletedLineName = "";
+               
+               if(RunOneCycle)
+               {
+                  Print(">>> وضع الدورة الواحدة مفعّل - الإكسبرت سيتوقف الآن <<<");
+                  cycleCompleted = true;
+                  return;
+               }
+               
+               Print("سيتم بداية دورة جديدة...");
+               
+               StartNewCycle();
+            }
+         }
+      }
+   }
+}
+
+void RemoveLineFromStatus(int index)
+{
+   int size = ArraySize(lineStatuses);
+   
+   if(index < 0 || index >= size)
+      return;
+   
+   Print("حذف الخط من التتبع: ", lineStatuses[index].lineName);
+   
+   for(int i = index; i < size - 1; i++)
+   {
+      lineStatuses[i].lineName = lineStatuses[i + 1].lineName;
+      lineStatuses[i].priceLevel = lineStatuses[i + 1].priceLevel;
+      lineStatuses[i].lastPosition = lineStatuses[i + 1].lastPosition;
+      lineStatuses[i].ticket = lineStatuses[i + 1].ticket;
+      lineStatuses[i].openEquity = lineStatuses[i + 1].openEquity;
+      lineStatuses[i].targetProfit = lineStatuses[i + 1].targetProfit;
+      lineStatuses[i].tradeCount = lineStatuses[i + 1].tradeCount;
+      lineStatuses[i].hasOpenedTrade = lineStatuses[i + 1].hasOpenedTrade;
+      lineStatuses[i].isOpening = lineStatuses[i + 1].isOpening;
+      lineStatuses[i].isFirstTrade = lineStatuses[i + 1].isFirstTrade;
+      lineStatuses[i].redLinePrice = lineStatuses[i + 1].redLinePrice;
+   }
+   
+   ArrayResize(lineStatuses, size - 1);
+   
+   Print("عدد الخطوط المتبقية: ", ArraySize(lineStatuses));
+}
+
+bool IsLineLevelExists(double priceLevel, double tolerance = 0.0001)
+{
+   long chartID = ChartID();
+   int totalObjects = ObjectsTotal(chartID);
+   
+   for(int i = 0; i < totalObjects; i++)
+   {
+      string objectName = ObjectName(chartID, i);
+      
+      if(StringFind(objectName, "GridLine_") >= 0)
+      {
+         double existingPrice = ObjectGetDouble(chartID, objectName, OBJPROP_PRICE);
+         
+         if(MathAbs(existingPrice - priceLevel) <= tolerance)
+         {
+            return true;
+         }
+      }
+   }
+   
+   return false;
+}
+
+void DrawLines()
+{
+   long chartID = ChartID();
+   double currentPrice = iClose(_Symbol, _Period, 0);
+   double gridStepPrice = PipsToPrice(GridStepPips);
+   double halfStepPrice = PipsToPrice(GridStepPips / 2.0);
+   
+   Print("==============================================");
+   Print("🎨 بداية رسم خطوط Grid (مرة واحدة فقط)");
+   Print("==============================================");
+   Print("السعر الحالي: ", currentPrice);
+   Print("المسافة الكاملة: ", GridStepPips, " نقطة");
+   Print("نصف المسافة (الخط الأول): ", (GridStepPips / 2.0), " نقطة");
+   Print("عدد الخطوط فوق/تحت: ", NumberOfLines);
+   Print("==============================================");
+   
+   int linesDrawn = 0;
+   
+   for(int i = 1; i <= NumberOfLines; i++)
+   {
+      double linePrice;
+      
+      if(i == 1)
+      {
+         linePrice = currentPrice + halfStepPrice;
+      }
+      else
+      {
+         linePrice = currentPrice + halfStepPrice + ((i - 1) * gridStepPrice);
+      }
+      
+      string lineName = "GridLine_UP_" + IntegerToString(i) + "_" + DoubleToString(linePrice, _Digits);
+      
+      if(!IsLineLevelExists(linePrice))
+      {
+         if(ObjectCreate(chartID, lineName, OBJ_HLINE, 0, 0, linePrice))
+         {
+            ObjectSetInteger(chartID, lineName, OBJPROP_COLOR, clrOrange);
+            ObjectSetInteger(chartID, lineName, OBJPROP_STYLE, STYLE_DOT);
+            ObjectSetInteger(chartID, lineName, OBJPROP_WIDTH, 1);
+            ObjectSetInteger(chartID, lineName, OBJPROP_BACK, true);
+            ObjectSetInteger(chartID, lineName, OBJPROP_SELECTABLE, false);
+            ObjectSetInteger(chartID, lineName, OBJPROP_SELECTED, false);
+            
+            linesDrawn++;
+            double distancePips = PriceDistanceInPips(currentPrice, linePrice);
+            Print("✅ خط فوق #", i, ": ", lineName);
+            Print("   السعر: ", linePrice, " | المسافة: ", distancePips, " نقطة");
+         }
+      }
+   }
+   
+   for(int i = 1; i <= NumberOfLines; i++)
+   {
+      double linePrice;
+      
+      if(i == 1)
+      {
+         linePrice = currentPrice - halfStepPrice;
+      }
+      else
+      {
+         linePrice = currentPrice - halfStepPrice - ((i - 1) * gridStepPrice);
+      }
+      
+      string lineName = "GridLine_DOWN_" + IntegerToString(i) + "_" + DoubleToString(linePrice, _Digits);
+      
+      if(!IsLineLevelExists(linePrice))
+      {
+         if(ObjectCreate(chartID, lineName, OBJ_HLINE, 0, 0, linePrice))
+         {
+            ObjectSetInteger(chartID, lineName, OBJPROP_COLOR, clrOrange);
+            ObjectSetInteger(chartID, lineName, OBJPROP_STYLE, STYLE_DOT);
+            ObjectSetInteger(chartID, lineName, OBJPROP_WIDTH, 1);
+            ObjectSetInteger(chartID, lineName, OBJPROP_BACK, true);
+            ObjectSetInteger(chartID, lineName, OBJPROP_SELECTABLE, false);
+            ObjectSetInteger(chartID, lineName, OBJPROP_SELECTED, false);
+            
+            linesDrawn++;
+            double distancePips = PriceDistanceInPips(currentPrice, linePrice);
+            Print("✅ خط تحت #", i, ": ", lineName);
+            Print("   السعر: ", linePrice, " | المسافة: ", distancePips, " نقطة");
+         }
+      }
+   }
+   
+   Print("==============================================");
+   Print("✅ انتهى رسم خطوط Grid");
+   Print("عدد الخطوط المرسومة: ", linesDrawn);
+   Print("==============================================");
+   
+   ChartRedraw(chartID);
+}
+
+void AddLineToStatus(string lineName, double priceLevel)
+{
+   int currentSize = ArraySize(lineStatuses);
+   ArrayResize(lineStatuses, currentSize + 1);
+   
+   double currentClose = iClose(_Symbol, _Period, 1);
+   
+   lineStatuses[currentSize].lineName = lineName;
+   lineStatuses[currentSize].priceLevel = priceLevel;
+   
+   if(currentClose > priceLevel)
+      lineStatuses[currentSize].lastPosition = 1;
+   else if(currentClose < priceLevel)
+      lineStatuses[currentSize].lastPosition = -1;
+   else
+      lineStatuses[currentSize].lastPosition = 0;
+      
+   lineStatuses[currentSize].ticket = 0;
+   lineStatuses[currentSize].openEquity = 0;
+   lineStatuses[currentSize].targetProfit = 0;
+   lineStatuses[currentSize].tradeCount = 0;
+   lineStatuses[currentSize].hasOpenedTrade = false;
+   lineStatuses[currentSize].isOpening = false;
+   lineStatuses[currentSize].isFirstTrade = false;
+   lineStatuses[currentSize].redLinePrice = 0;
+}
+
+void InitializeLineStatuses()
+{
+   long chartID = ChartID();
+   int totalObjects = ObjectsTotal(chartID);
+   int lineCount = 0;
+   
+   for(int i = 0; i < totalObjects; i++)
+   {
+      string objectName = ObjectName(chartID, i);
+      if(StringFind(objectName, "GridLine_") >= 0)
+      {
+         lineCount++;
+      }
+   }
+   
+   ArrayResize(lineStatuses, lineCount);
+   
+   int index = 0;
+   double currentClose = iClose(_Symbol, _Period, 1);
+   
+   for(int i = 0; i < totalObjects; i++)
+   {
+      string objectName = ObjectName(chartID, i);
+      
+      if(StringFind(objectName, "GridLine_") >= 0)
+      {
+         double linePrice = ObjectGetDouble(chartID, objectName, OBJPROP_PRICE);
+         color lineColor = (color)ObjectGetInteger(chartID, objectName, OBJPROP_COLOR);
+         
+         lineStatuses[index].lineName = objectName;
+         lineStatuses[index].priceLevel = linePrice;
+         
+         if(currentClose > linePrice)
+            lineStatuses[index].lastPosition = 1;
+         else if(currentClose < linePrice)
+            lineStatuses[index].lastPosition = -1;
+         else
+            lineStatuses[index].lastPosition = 0;
+         
+         ulong foundTicket = 0;
+         int totalPositions = PositionsTotal();
+         
+         for(int p = 0; p < totalPositions; p++)
+         {
+            ulong ticket = PositionGetTicket(p);
+            if(ticket > 0)
+            {
+               string posComment = PositionGetString(POSITION_COMMENT);
+               
+               if(StringFind(posComment, objectName) >= 0)
+               {
+                  foundTicket = ticket;
+                  Print("تم العثور على صفقة مفتوحة للخط: ", objectName, " | Ticket: ", foundTicket);
+                  break;
+               }
+            }
+         }
+         
+         if(foundTicket > 0)
+         {
+            lineStatuses[index].ticket = foundTicket;
+            lineStatuses[index].hasOpenedTrade = true;
+            lineStatuses[index].isFirstTrade = false;
+            
+            if(PositionSelectByTicket(foundTicket))
+            {
+               ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+               lineStatuses[index].lastPosition = (posType == POSITION_TYPE_BUY) ? 1 : -1;
+            }
+            
+            lineStatuses[index].openEquity = 0;
+            lineStatuses[index].targetProfit = 0;
+            lineStatuses[index].tradeCount = 1;
+            lineStatuses[index].redLinePrice = 0;
+            
+            Print("الخط ", objectName, " مربوط مع الصفقة - جاهز للعمل!");
+         }
+         else
+         {
+            lineStatuses[index].ticket = 0;
+            lineStatuses[index].openEquity = 0;
+            lineStatuses[index].targetProfit = 0;
+            lineStatuses[index].tradeCount = 0;
+            lineStatuses[index].hasOpenedTrade = false;
+            lineStatuses[index].isFirstTrade = false;
+            lineStatuses[index].redLinePrice = 0;
+         }
+         
+         lineStatuses[index].isOpening = false;
+         
+         index++;
+      }
+   }
+   
+   Print("تم تهيئة ", lineCount, " خط");
+}
+
+//+------------------------------------------------------------------+
+//| ⭐⭐⭐ فحص اختراق الخطوط (مع إعادة رسم الخطوط) ⭐⭐⭐               |
+//+------------------------------------------------------------------+
+void CheckLinesCrossing()
+{
+   long chartID = ChartID();
+   double currentClose = iClose(_Symbol, _Period, 1);
+   
+   // ⭐ فحص الصفقات الربحانة قبل أي خسارة
+   if(globalTotalLoss == 0)
+   {
+      for(int j = ArraySize(lineStatuses) - 1; j >= 0; j--)
+      {
+         if(lineStatuses[j].ticket > 0 && lineStatuses[j].isFirstTrade)
+         {
+            if(PositionSelectByTicket(lineStatuses[j].ticket))
+            {
+               ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+               double currentProfit = PositionGetDouble(POSITION_PROFIT);
+               
+               bool crossedOrangeLine = false;
+               
+               for(int k = 0; k < ArraySize(lineStatuses); k++)
+               {
+                  if(k == j) continue;
+                  
+                  if(lineStatuses[k].ticket == 0)
+                  {
+                     if(posType == POSITION_TYPE_BUY)
+                     {
+                        if(currentClose > lineStatuses[k].priceLevel && lineStatuses[k].priceLevel > lineStatuses[j].priceLevel)
+                        {
+                           crossedOrangeLine = true;
+                           break;
+                        }
+                     }
+                     else
+                     {
+                        if(currentClose < lineStatuses[k].priceLevel && lineStatuses[k].priceLevel < lineStatuses[j].priceLevel)
+                        {
+                           crossedOrangeLine = true;
+                           break;
+                        }
+                     }
+                  }
+               }
+               
+               if(crossedOrangeLine && currentProfit > 0)
+               {
+                  Print("🎯 صفقة ربحانة على الخط ", lineStatuses[j].lineName, " | الربح: ", currentProfit);
+                  Print("السعر اخترق خط برتقالي - سيتم إقفال الصفقة");
+                  
+                  ClosePositionForce(lineStatuses[j].ticket, 10);
+                  
+                  DeleteTargetLabel(lineStatuses[j].lineName);
+                  
+                  RedrawOrangeLine(lineStatuses[j].lineName, lineStatuses[j].priceLevel);
+                  
+                  lineStatuses[j].ticket = 0;
+                  lineStatuses[j].hasOpenedTrade = false;
+                  lineStatuses[j].isFirstTrade = false;
+                  lineStatuses[j].tradeCount = 0;
+                  lineStatuses[j].redLinePrice = 0;
+                  
+                  ChartRedraw(chartID);
+               }
+            }
+         }
+      }
+   }
+   
+   // ⭐ فحص اختراق الخطوط البرتقالية
+   for(int i = 0; i < ArraySize(lineStatuses); i++)
+   {
+      int newPosition;
+      
+      if(currentClose > lineStatuses[i].priceLevel)
+         newPosition = 1;
+      else if(currentClose < lineStatuses[i].priceLevel)
+         newPosition = -1;
+      else
+         continue;
+      
+      if(newPosition != lineStatuses[i].lastPosition)
+      {
+         Print("اختراق للخط: ", lineStatuses[i].lineName, " | السعر: ", lineStatuses[i].priceLevel);
+         
+         if(!lineStatuses[i].hasOpenedTrade)
+         {
+            if(lineStatuses[i].ticket > 0)
+            {
+               Print("⚠️ الخط ", lineStatuses[i].lineName, " عليه صفقة مفتوحة بالفعل");
+               lineStatuses[i].hasOpenedTrade = true;
+               continue;
+            }
+            
+            bool hasExistingPosition = false;
+            int totalPos = PositionsTotal();
+            for(int p = 0; p < totalPos; p++)
+            {
+               ulong ticket = PositionGetTicket(p);
+               if(ticket > 0)
+               {
+                  string posComment = PositionGetString(POSITION_COMMENT);
+                  if(StringFind(posComment, lineStatuses[i].lineName) >= 0)
+                  {
+                     hasExistingPosition = true;
+                     lineStatuses[i].ticket = ticket;
+                     lineStatuses[i].hasOpenedTrade = true;
+                     break;
+                  }
+               }
+            }
+            
+            if(hasExistingPosition)
+            {
+               continue;
+            }
+            
+            if(lineStatuses[i].isOpening)
+            {
+               Print("⚠️ عملية فتح جارية على الخط ", lineStatuses[i].lineName);
+               continue;
+            }
+            
+            double distanceFromLine = PriceDistanceInPips(currentClose, lineStatuses[i].priceLevel);
+            
+            if(distanceFromLine > MaxDistanceForNewEntry)
+            {
+               Print("المسافة كبيرة - سيتم حذف الخط البرتقالي: ", lineStatuses[i].lineName);
+               
+               ObjectDelete(chartID, lineStatuses[i].lineName);
+               RemoveLineFromStatus(i);
+               ChartRedraw(chartID);
+               
+               i--;
+               continue;
+            }
+         }
+         
+         lineStatuses[i].isOpening = true;
+         
+         double lastLoss = 0;
+         if(lineStatuses[i].ticket > 0)
+         {
+            if(PositionSelectByTicket(lineStatuses[i].ticket))
+            {
+               lastLoss = PositionGetDouble(POSITION_PROFIT);
+               
+               if(lastLoss < 0)
+               {
+                  globalTotalLoss += MathAbs(lastLoss);
+                  Print("💰 خسارة على العكس: ", MathAbs(lastLoss), " | إجمالي الخسائر العام: ", globalTotalLoss);
+               }
+            }
+            
+            bool closed = ClosePositionForce(lineStatuses[i].ticket, 10);
+            
+            if(!closed)
+            {
+               Print("❌ فشل الإغلاق - لن يتم فتح صفقة جديدة");
+               lineStatuses[i].isOpening = false;
+               continue;
+            }
+            
+            DeleteTargetLabel(lineStatuses[i].lineName);
+            
+            // ⭐ إعادة رسم الخط القديم
+            if(lastDeletedLineName != "")
+            {
+               RestorePreviousDeletedLine();
+            }
+            
+            lineStatuses[i].ticket = 0;
+         }
+         
+         double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+         lineStatuses[i].openEquity = currentEquity;
+         lineStatuses[i].tradeCount++;
+         
+         if(lineStatuses[i].tradeCount == 1 && globalTotalLoss == 0)
+         {
+            lineStatuses[i].isFirstTrade = true;
+            lineStatuses[i].targetProfit = 0;
+            Print("🎯 صفقة أولى | ستُقفل عند اختراق خط برتقالي آخر إذا كانت ربحانة");
+         }
+         else
+         {
+            lineStatuses[i].isFirstTrade = false;
+            lineStatuses[i].targetProfit = 0;
+            Print("🎯 صفقة في نظام التوزيع");
+         }
+         
+         Print("عدد الصفقات على الخط ", lineStatuses[i].lineName, " = ", lineStatuses[i].tradeCount);
+         
+         if(newPosition == 1)
+         {
+            lineStatuses[i].ticket = OpenBuy(lineStatuses[i].lineName);
+            
+            if(lineStatuses[i].ticket > 0)
+            {
+               lineStatuses[i].hasOpenedTrade = true;
+               
+               // ⭐ حذف الخط البرتقالي + حفظه كآخر خط محذوف
+               lastDeletedLineName = lineStatuses[i].lineName;
+               ObjectDelete(chartID, lineStatuses[i].lineName);
+               Print("✂️ تم حذف الخط البرتقالي: ", lineStatuses[i].lineName);
+               
+               // ⭐ رسم الخط الأحمر
+               double redLinePrice = AddOnePip(iLow(_Symbol, _Period, 1), false);
+               lineStatuses[i].redLinePrice = redLinePrice;
+               DrawRedLine(redLinePrice);
+               
+               Print("🔴 تم رسم الخط الأحمر عند: ", redLinePrice, " (Low - 1 نقطة)");
+               
+               ChartRedraw(chartID);
+               
+               if(!lineStatuses[i].isFirstTrade)
+               {
+                  RecalculateAllTargets();
+               }
+            }
+         }
+         else if(newPosition == -1)
+         {
+            lineStatuses[i].ticket = OpenSell(lineStatuses[i].lineName);
+            
+            if(lineStatuses[i].ticket > 0)
+            {
+               lineStatuses[i].hasOpenedTrade = true;
+               
+               // ⭐ حذف الخط البرتقالي + حفظه كآخر خط محذوف
+               lastDeletedLineName = lineStatuses[i].lineName;
+               ObjectDelete(chartID, lineStatuses[i].lineName);
+               Print("✂️ تم حذف الخط البرتقالي: ", lineStatuses[i].lineName);
+               
+               // ⭐ رسم الخط الأحمر
+               double redLinePrice = AddOnePip(iHigh(_Symbol, _Period, 1), true);
+               lineStatuses[i].redLinePrice = redLinePrice;
+               DrawRedLine(redLinePrice);
+               
+               Print("🔴 تم رسم الخط الأحمر عند: ", redLinePrice, " (High + 1 نقطة)");
+               
+               ChartRedraw(chartID);
+               
+               if(!lineStatuses[i].isFirstTrade)
+               {
+                  RecalculateAllTargets();
+               }
+            }
+         }
+         
+         lineStatuses[i].isOpening = false;
+         
+         lineStatuses[i].lastPosition = newPosition;
+      }
+   }
+}
+
+ulong OpenBuy(string lineName)
+{
+   double lotSize = CalculateLotSize();
+   
+   MqlTradeRequest request;
+   MqlTradeResult result;
+   ZeroMemory(request);
+   ZeroMemory(result);
+   
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = _Symbol;
+   request.volume = lotSize;
+   request.type = ORDER_TYPE_BUY;
+   request.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   request.deviation = Slippage;
+   request.magic = 123456;
+   request.comment = CommentPrefix + lineName;
+   
+   if(OrderSend(request, result))
+   {
+      if(result.retcode == TRADE_RETCODE_DONE)
+      {
+         Print("✅ صفقة شراء مفتوحة: ", lineName, " | Ticket: ", result.order);
+         return result.order;
+      }
+   }
+   
+   Print("❌ فشل فتح صفقة شراء: ", lineName);
+   return 0;
+}
+
+ulong OpenSell(string lineName)
+{
+   double lotSize = CalculateLotSize();
+   
+   MqlTradeRequest request;
+   MqlTradeResult result;
+   ZeroMemory(request);
+   ZeroMemory(result);
+   
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = _Symbol;
+   request.volume = lotSize;
+   request.type = ORDER_TYPE_SELL;
+   request.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   request.deviation = Slippage;
+   request.magic = 123456;
+   request.comment = CommentPrefix + lineName;
+   
+   if(OrderSend(request, result))
+   {
+      if(result.retcode == TRADE_RETCODE_DONE)
+      {
+         Print("✅ صفقة بيع مفتوحة: ", lineName, " | Ticket: ", result.order);
+         return result.order;
+      }
+   }
+   
+   Print("❌ فشل فتح صفقة بيع: ", lineName);
+   return 0;
+}
+
+void DeleteAllLines()
+{
+   long chartID = ChartID();
+   int totalObjects = ObjectsTotal(chartID);
+   
+   for(int i = totalObjects - 1; i >= 0; i--)
+   {
+      string objectName = ObjectName(chartID, i);
+      
+      if(StringFind(objectName, "GridLine_") >= 0)
+      {
+         ObjectDelete(chartID, objectName);
+      }
+      
+      if(StringFind(objectName, "Target_") >= 0)
+      {
+         ObjectDelete(chartID, objectName);
+      }
+   }
+}
+
+void DeleteOrangeLinesOnly()
+{
+   long chartID = ChartID();
+   int totalObjects = ObjectsTotal(chartID);
+   int deletedCount = 0;
+   
+   for(int i = totalObjects - 1; i >= 0; i--)
+   {
+      string objectName = ObjectName(chartID, i);
+      
+      if(StringFind(objectName, "GridLine_") >= 0)
+      {
+         color lineColor = (color)ObjectGetInteger(chartID, objectName, OBJPROP_COLOR);
+         
+         if(lineColor == clrOrange)
+         {
+            ObjectDelete(chartID, objectName);
+            deletedCount++;
+         }
+      }
+   }
+   
+   Print("تم حذف ", deletedCount, " خط برتقالي");
+}
